@@ -1,0 +1,59 @@
+#!/bin/bash
+
+this=$(basename "$0")
+
+usage(){
+
+cat <<EOF
+$this [<commit>] [--] [<path>...]
+$this --cached [<commit>] [--] [<path>...]
+$this <commit> <commit> [--] [<path>...]
+EOF
+}
+
+THIS_ARGS="$(getopt -o 'h' --long help,cached,filter: -- "$@")"
+[[ $? != "0" ]] && { echo "argument error."; return 1; };
+eval set -- "$THIS_ARGS"
+
+DIFF_ARGS=()
+FILTERS=""
+
+while :; do
+    case "${1}" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --cached)
+            DIFF_ARGS+=("--cached")
+            CACHED="--cached"
+            shift;;
+        --filter)
+            [[ -n "$2" ]] && {
+                [[ -n "$FILTERS" ]] && FILTERS="${FILTERS},"
+                FILTERS="${FILTERS}$2"
+            }
+            shift 2;;
+        --)
+            DIFF_ARGS+=("--")
+            shift
+            break;;
+        *) echo "unknow options"; return 1 ;;
+    esac
+done
+
+DIFF_ARGS+=("$@")
+
+[[ -z "$FILTERS" ]] && FILTERS="-legal/copyright,-readability/inheritance"
+
+
+git diff --name-only "${DIFF_ARGS[@]}" | grep '' | \
+    while read -r filename; do
+        [[ $filename =~ \.(c|C|cc|CC|cpp|CPP|cxx|CXX|h|H|hpp|HPP)$ ]] && {
+            python "$(dirname "$0")/check-list-diff.py" -p1 \
+                --diff=<(git diff $CACHED -U0 -- "$filename") \
+                --listfile=<(python "$(dirname "$0")/cpplint.py" --filter="$FILTERS" "$filename" 2>&1 1>/dev/null) \
+                --format='^{filename}:{lineno}:'
+        }
+    done
+
