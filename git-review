@@ -486,10 +486,14 @@ __config(){
         [[ -n "$USERNAME" ]] && break
     done
 
-    read -e -p "ssh host:port [不填先就默认为 gerritu4.ucweb.local:29418]: " SSH_HOST
-    [[ -z "$SSH_HOST" ]] && SSH_HOST="gerritu4.ucweb.local:29418"
-    read -e -p "http host:port [不填先就默认为 gerritu4.ucweb.local:8080]: " HTTP_HOST
-    [[ -z "$HTTP_HOST" ]] && HTTP_HOST="gerritu4.ucweb.local:8080"
+    while true; do
+        read -e -p "ssh host:port: " SSH_HOST
+        [[ -n "$SSH_HOST" ]] && break
+    done
+    while true; do
+        read -e -p "http host:port: " HTTP_HOST
+        [[ -n "$HTTP_HOST" ]] && break
+    done
 
     echo "浏览器登录gerrit页面 -> 页面右上角,用户名下拉 -> 设置 ->"
     echo "http password -> 若没有PASSWORD就点击generate password."
