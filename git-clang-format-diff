@@ -1,0 +1,102 @@
+#!/bin/bash
+
+this=$(basename "$0")
+which clang-format-diff-3.4 &>/dev/null && CLANG_FORMAT_DIFF_SCRIPT="$(which clang-format-diff-3.4)"
+which clang-format-diff-3.5 &>/dev/null && CLANG_FORMAT_DIFF_SCRIPT="$(which clang-format-diff-3.5)"
+
+
+[[ -z "$CLANG_FORMAT_DIFF_SCRIPT" ]] && {
+
+cat >&2 <<EOF
+没有找到clang-format-diff-3.5或clang-format-diff-3.4
+apt-get install clang-format-3.4
+或
+apt-get install clang-format-3.4
+EOF
+}
+
+
+usage(){
+
+cat <<EOF
+$this [format-option] [<commit>]
+$this [format-option] --cached [<commit>]
+$this [format-option] <commit> <commit>
+
+format-option:
+-c: chromium style
+-g: google style
+-w: webkit style
+
+EOF
+}
+
+
+THIS_ARGS="$(getopt -o 'hgcw' --long help,cached -- "$@")"
+[[ $? != "0" ]] && { echo "argument error."; return 1; };
+eval set -- "$THIS_ARGS"
+
+COMMITS=()
+DIFF_ARGS=()
+FORMAT_ARGS=()
+
+while :; do
+    case "${1}" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --cached)
+            DIFF_ARGS+=("--cached")
+            shift;;
+        -c)
+            FORMAT_ARGS+=("Chromium")
+            shift
+            ;;
+        -g)
+            FORMAT_ARGS+=("Google")
+            shift
+            ;;
+        -w)
+            FORMAT_ARGS+=("Webkit")
+            shift
+            ;;
+        --)
+            shift
+            break;;
+        *) echo "unknow options"; return 1 ;;
+    esac
+done
+
+COMMITS+=("$@")
+
+TOPLEVEL="$(cd "$(git rev-parse --show-toplevel)" && pwd)"
+cd "$TOPLEVEL"
+
+if [[ "${#FORMAT_ARGS[@]}" -eq 0 ]] ; then
+    usage
+    echo "你必须提供一个style" >&2
+    exit 1
+fi
+if [[ "${#FORMAT_ARGS[@]}" -gt 1 ]] ; then
+    usage
+    echo "你只能提供一个style" >&2
+    exit 1
+fi
+
+
+for c in "${COMMITS[@]}"; do
+    if ! git rev-parse "$c" &>/dev/null; then
+        echo "commit: $c 不存在." >&2
+        exit 1
+    fi
+done
+
+git diff --name-only "${DIFF_ARGS[@]}" "${COMMITS[@]}" | \
+    while read -r filename; do
+        if [[ $filename =~ \.(c|C|cc|CC|cpp|CPP|cxx|CXX|h|H|hpp|HPP)$ ]]; then
+            echo "正在format: $filename"
+            echo git diff -U0 "${DIFF_ARGS[@]}" "${COMMITS[@]}" -- "$filename" '|' "$CLANG_FORMAT_DIFF_SCRIPT" -p1 -i
+            git diff -U0 "${DIFF_ARGS[@]}" "${COMMITS[@]}" -- "$filename" | "$CLANG_FORMAT_DIFF_SCRIPT" -p1 -i
+        fi
+    done

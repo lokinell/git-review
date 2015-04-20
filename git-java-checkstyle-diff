@@ -1,5 +1,4 @@
 #!/bin/bash
-
 this=$(basename "$0")
 
 usage(){
@@ -11,13 +10,12 @@ $this <commit> <commit>
 EOF
 }
 
-THIS_ARGS="$(getopt -o 'h' --long help,cached,filter: -- "$@")"
+THIS_ARGS="$(getopt -o 'h' --long help,cached -- "$@")"
 [[ $? != "0" ]] && { echo "argument error."; return 1; };
 eval set -- "$THIS_ARGS"
 
-DIFF_ARGS=()
 COMMITS=()
-FILTERS=""
+DIFF_ARGS=()
 
 while :; do
     case "${1}" in
@@ -28,12 +26,6 @@ while :; do
         --cached)
             DIFF_ARGS+=("--cached")
             shift;;
-        --filter)
-            [[ -n "$2" ]] && {
-                [[ -n "$FILTERS" ]] && FILTERS="${FILTERS},"
-                FILTERS="${FILTERS}$2"
-            }
-            shift 2;;
         --)
             shift
             break;;
@@ -46,6 +38,7 @@ COMMITS+=("$@")
 TOPLEVEL="$(cd "$(git rev-parse --show-toplevel)" && pwd)"
 cd "$TOPLEVEL"
 
+
 for c in "${COMMITS[@]}"; do
     if ! git rev-parse "$c" &>/dev/null; then
         echo "commit: $c 不存在." >&2
@@ -53,16 +46,25 @@ for c in "${COMMITS[@]}"; do
     fi
 done
 
-[[ -z "$FILTERS" ]] && FILTERS="-legal/copyright,-readability/inheritance"
+checkstyle(){
+    java \
+    -jar "$(dirname "$0")/git_review/checkstyle/checkstyle-5.9-all.jar" \
+    -c "$(dirname "$0")/git_review/checkstyle/chromium-style-5.0.xml" "$@" | \
+        while IFS=':' read -r __file __line __msg
+        do
+            echo "${__file#${TOPLEVEL}/}:$__line:$__msg";
+        done
+}
 
 
 git diff --name-only "${DIFF_ARGS[@]}" "${COMMITS[@]}" | \
     while read -r filename; do
-        [[ $filename =~ \.(c|C|cc|CC|cpp|CPP|cxx|CXX|h|H|hpp|HPP)$ ]] && {
+        if [[ $filename =~ \.java$ ]]; then
             python "$(dirname "$0")/check-list-diff.py" -p1 \
-                --diff=<(git diff "${DIFF_ARGS[@]}" -U0 "${COMMITS[@]}" -- "$filename") \
-                --listfile=<(python "$(dirname "$0")/cpplint.py" --filter="$FILTERS" "$filename" 2>&1 1>/dev/null) \
+                --diff=<(git diff -U0 "${DIFF_ARGS[@]}" "${COMMITS[@]}" -- "$filename") \
+                --listfile=<(checkstyle "$filename") \
                 --format='^{filename}:{lineno}:'
-        }
+        fi
     done
+
 

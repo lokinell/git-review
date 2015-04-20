@@ -1,0 +1,71 @@
+#!/bin/bash
+
+this=$(basename "$0")
+
+usage(){
+
+cat <<EOF
+$this [--all] [<commit>] [--] [<path>...]
+$this [--all] --cached [<commit>] [--] [<path>...]
+$this [--all] <commit> <commit> [--] [<path>...]
+EOF
+}
+
+THIS_ARGS="$(getopt -o 'h' --long help,cached,all -- "$@")"
+[[ $? != "0" ]] && { echo "argument error."; exit 1; };
+eval set -- "$THIS_ARGS"
+
+DIFF_ARGS=()
+COMMITS=()
+
+while :; do
+    case "${1}" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --cached)
+            DIFF_ARGS+=("--cached")
+            shift;;
+        --all)
+            SHOW_ALL=true
+            shift;;
+        --)
+            shift
+            break;;
+        *) echo "unknow options"; return 1 ;;
+    esac
+done
+
+COMMITS+=("$@")
+
+TOPLEVEL="$(cd "$(git rev-parse --show-toplevel)" && pwd)"
+cd "$TOPLEVEL"
+
+for c in "${COMMITS[@]}"; do
+    if ! git rev-parse "$c" &>/dev/null; then
+        echo "commit: $c 不存在." >&2
+        exit 1
+    fi
+done
+
+# $1 ==> dir or file path
+get_owners(){
+    local dirpath="$1"
+    [[ -f "$dirpath" ]] && dirpath="$(dirname "$dirpath")"
+    dirpath="$(cd "$dirpath" && pwd)"
+    while :; do
+        if [[ -f "$dirpath/OWNERS.u4" ]]; then
+            sed -ne '/^\s*#.*/d; /^\s*per-file\s.*/d; /^\s*$/d; p' $dirpath/OWNERS.u4
+            [[ "$SHOW_ALL" != "true" ]] && break
+        fi
+        if [[ "$dirpath" == "$TOPLEVEL" ]] || [[ "$dirpath" == "/" ]]; then break; fi
+        dirpath="$(dirname "$dirpath")"
+    done
+}
+
+
+git diff --name-only "${DIFF_ARGS[@]}" "${COMMITS[@]}" | \
+    while read -r filename; do
+        get_owners "$filename"
+    done

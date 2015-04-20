@@ -5,9 +5,9 @@ this=$(basename "$0")
 usage(){
 
 cat <<EOF
-$this [<commit>] [--] [<path>...]
-$this --cached [<commit>] [--] [<path>...]
-$this <commit> <commit> [--] [<path>...]
+$this [<commit>]
+$this --cached [<commit>]
+$this <commit> <commit>
 EOF
 }
 
@@ -15,6 +15,7 @@ THIS_ARGS="$(getopt -o 'h' --long help,cached -- "$@")"
 [[ $? != "0" ]] && { echo "argument error."; return 1; };
 eval set -- "$THIS_ARGS"
 
+COMMITS=()
 DIFF_ARGS=()
 
 while :; do
@@ -25,23 +26,32 @@ while :; do
             ;;
         --cached)
             DIFF_ARGS+=("--cached")
-            CACHED="--cached"
             shift;;
         --)
-            DIFF_ARGS+=("--")
             shift
             break;;
         *) echo "unknow options"; return 1 ;;
     esac
 done
 
-DIFF_ARGS+=("$@")
+COMMITS+=("$@")
 
-git diff --name-only "${DIFF_ARGS[@]}" | grep '' | \
+TOPLEVEL="$(cd "$(git rev-parse --show-toplevel)" && pwd)"
+cd "$TOPLEVEL"
+
+
+for c in "${COMMITS[@]}"; do
+    if ! git rev-parse "$c" &>/dev/null; then
+        echo "commit: $c 不存在." >&2
+        exit 1
+    fi
+done
+
+git diff --name-only "${DIFF_ARGS[@]}" "${COMMITS[@]}" | \
     while read -r filename; do
         if [[ $filename =~ \.(sh|bash)$ ]] || [[ "$(sed -ne '1{ /^#.*sh$/p }' "$filename")" ]] ; then
             python "$(dirname "$0")/check-list-diff.py" -p1 \
-                --diff=<(git diff $CACHED -U0 -- "$filename") \
+                --diff=<(git diff -U0 "${DIFF_ARGS[@]}" "${COMMITS[@]}" -- "$filename") \
                 --listfile=<(shellcheck --format=gcc "$filename") \
                 --format='^{filename}:{lineno}:'
         fi

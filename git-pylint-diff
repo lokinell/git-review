@@ -5,9 +5,9 @@ this=$(basename "$0")
 usage(){
 
 cat <<EOF
-$this [<commit>] [--] [<path>...]
-$this --cached [<commit>] [--] [<path>...]
-$this <commit> <commit> [--] [<path>...]
+$this [<commit>]
+$this --cached [<commit>]
+$this <commit> <commit>
 EOF
 }
 
@@ -16,6 +16,7 @@ THIS_ARGS="$(getopt -o 'h' --long help,cached -- "$@")"
 eval set -- "$THIS_ARGS"
 
 DIFF_ARGS=()
+COMMITS=()
 
 while :; do
     case "${1}" in
@@ -25,23 +26,31 @@ while :; do
             ;;
         --cached)
             DIFF_ARGS+=("--cached")
-            CACHED="--cached"
             shift;;
         --)
-            DIFF_ARGS+=("--")
             shift
             break;;
         *) echo "unknow options"; return 1 ;;
     esac
 done
 
-DIFF_ARGS+=("$@")
+COMMITS+=("$@")
 
-git diff --name-only "${DIFF_ARGS[@]}" | grep '' | \
+TOPLEVEL="$(cd "$(git rev-parse --show-toplevel)" && pwd)"
+cd "$TOPLEVEL"
+
+for c in "${COMMITS[@]}"; do
+    if ! git rev-parse "$c" &>/dev/null; then
+        echo "commit: $c 不存在." >&2
+        exit 1
+    fi
+done
+
+git diff --name-only "${DIFF_ARGS[@]}" "${COMMITS[@]}" | \
     while read -r filename; do
         if [[ $filename =~ \.py$ ]] || [[ "$(sed -ne '1{ /^#.*python/p }' "$filename")" ]] ; then
             python "$(dirname "$0")/check-list-diff.py" -p1 \
-                --diff=<(git diff $CACHED -U0 -- "$filename") \
+                --diff=<(git diff "${DIFF_ARGS[@]}" -U0 "${COMMITS[@]}" -- "$filename") \
                 --listfile=<(pylint --msg-template='{path}:{line}:{column}: {msg}' "$filename") \
                 --format='^{filename}:{lineno}:'
         fi

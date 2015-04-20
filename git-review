@@ -12,10 +12,11 @@ NO_COLOR="\033[0m"
 BOLD="\033[1m"
 UNDERLINE="\033[4m"
 
-die() { echo -e "${RED}${@}${NO_COLOR}"; exit 1; }
-warn() { echo -e "${YELLOW}${@}${NO_COLOR}"; }
-good() { echo -e "${GREEN}${@}${NO_COLOR}"; }
-run(){ echo -e "${GREEN}${*}${NO_COLOR}"; "$@"; }
+die() { echo -e "${RED}${@}${NO_COLOR}" >&2 ; exit 1; }
+err() { echo -e "${RED}${@}${NO_COLOR}" >&2 ; }
+warn() { echo -e "${YELLOW}${@}${NO_COLOR}" >&2 ; }
+good() { echo -e "${GREEN}${@}${NO_COLOR}" >&2 ; }
+run(){ echo -e "${GREEN}${*}${NO_COLOR}" >&2 ; "$@"; }
 
 [[ -c /dev/fd/1 ]] && THIS_LESS="less -SRFX" || THIS_LESS="cat"
 
@@ -39,6 +40,7 @@ GIT_DIR=$($GIT rev-parse --git-dir 2>/dev/null)
 if [[ -z "$GIT_DIR" ]]; then
     die "$this can only be run from a git repository."
 fi
+cd "$(git rev-parse --show-toplevel)"
 
 
 CURRENT=$($GIT symbolic-ref -q HEAD || $GIT rev-parse HEAD)
@@ -46,12 +48,15 @@ CURRENT=${CURRENT#refs/heads/}
 
 REMOTE="origin" # 暂时固定为origin
 
-username="$($GIT config gerrit.username)"
-http_password="$($GIT config gerrit.httppassword)"
-http_host="$($GIT config gerrit.httphost)"
-ssh_host="$($GIT config gerrit.sshhost)"
+get_gerrit_configure(){
+    username="$($GIT config gerrit.username)"
+    http_password="$($GIT config gerrit.httppassword)"
+    http_host="$($GIT config gerrit.httphost)"
+    ssh_host="$($GIT config gerrit.sshhost)"
 
-rest_url="http://${http_host%/}"
+    rest_url="http://${http_host%/}"
+}
+
 
 rest(){ curl -s --digest -H "Accept: application/json" -u "$username:$http_password" "$@" | sed "1{ /)]}'/d }"; }
 get(){ rest -X GET "$@"; }
@@ -85,21 +90,21 @@ ask_yes_no() {
         local msg="$1 (y/n) [$2]: "
     fi
     while true; do
-        read -p "$msg" choice
-            case ${choice:-$2} in
-                y|Y|yes|Yes|YES)
-                    return 0
-                    ;;
-                n|no|No|NO)
-                    return 1
-                    ;;
-                *)
-                    warn "Please choose either y or n"
-                    ;;
-            esac
+        [[ -c /dev/fd/1 ]] && read -p "$msg" choice
+        case ${choice:-$2} in
+            y|Y|yes|Yes|YES)
+                return 0
+                ;;
+            n|no|No|NO)
+                return 1
+                ;;
+            *)
+                warn "Please choose either y or n"
+                [[ ! -c /dev/fd/1 ]] && return 1
+                ;;
+        esac
     done
 }
-
 
 selfinfo(){
     get "$rest_url/a/accounts/self"
@@ -109,66 +114,197 @@ selfinfo(){
 # $2 ==> patch_set(output)
 __guess_change_number(){
 
-    local __tmp_change_id
+    local __tmp_change_number
     local __tmp_change_patch_set
     unset "$1"
+    [[ -n "$2" ]] && unset "$2"
+    echo "正在根据当前的分支状态, 进行change number智能猜测...." >&2
 
     local __current=$($GIT symbolic-ref -q HEAD || $GIT rev-parse HEAD)
     __current=${__current#refs/heads/}
 
     if [[ "$__current" =~ ^changes/[0-9]+/[0-9]+$ ]]; then
-        IFS='/' read -r __tmp_change_id __tmp_change_patch_set <<< "${__current#changes/}"
+        IFS='/' read -r __tmp_change_number __tmp_change_patch_set <<< "${__current#changes/}"
+        good "由于当前正在change分支: $__current , 轻松获取到您的change number为: $__tmp_change_number, patchset number为: $__tmp_change_patch_set"
     else
         __get_change "$($GIT rev-parse HEAD)"
-        __tmp_change_id="$this_number"
-        __tmp_change_patch_set="$this_currentPatchSet_number"
-        [[ "$this_owner_username" != "$username" ]] && die "HEAD所指向的commit对应的change所属owner($this_owner_username)不为$username"
+        __tmp_change_number="$change_number"
+        __tmp_change_patch_set="$change_cur_number"
+        if [[ ! "$__tmp_change_number" =~ ^[0-9]+$ ]]; then
+            err "当前分支指向的commit不是一个change."
+            return 1
+        elif [[ "$change_owner_username" != "$username" ]]; then
+            err "HEAD所指向的commit对应的change不是你的! ($change_owner_username)"
+            return 1
+        fi
+        good "根据HEAD指向的commit, 轻松获取到您的change number为: $__tmp_change_number, patchset number为: $__tmp_change_patch_set"
     fi
-    [[ "$__tmp_change_id" =~ ^[0-9]+$ ]] && eval "$1=$__tmp_change_id"
+    if [[ "$__tmp_change_number" =~ ^[0-9]+$ ]]; then
+        eval "$1=$__tmp_change_number"
+    else
+        err "智能猜测change number失败!"
+        return 1
+    fi
     [[ -n "$2" ]] && [[ "$__tmp_change_patch_set" =~ ^[0-9]+$ ]] && eval "$2=$__tmp_change_patch_set"
+    return 0
+}
+
+__query_change(){
+    gerrit query --format=json --current-patch-set --patch-sets "$@" | while read -r line; do \
+        python - "$line" <<'PYTHONEOF'
+# -*- coding: utf-8 -*-
+import json,sys,codecs,time
+change=json.loads(sys.argv[1])
+if 'id' not in change:
+    sys.exit(1)
+output=[ change['id'], change['number'], change['owner']['username'], \
+    change['owner']['email'], change['status'], \
+    time.strftime('%m/%d %H:%M',time.localtime(float(change['lastUpdated']))), \
+    change['project'], change['branch'] ]
+if 'patchSets' in change:
+    output.append(len(change['patchSets']))
+else:
+    output.append(0)
+
+if 'currentPatchSet' in change:
+    output.append(change['currentPatchSet']['number'])
+    output.append(change['currentPatchSet']['ref'])
+    output.append(change['currentPatchSet']['author']['username'])
+else:
+    output.append('')
+    output.append('')
+    output.append('')
+
+output.append(change['url'])
+output.append('%s' % change['subject'].split('\n')[0][0:60].encode('utf-8'))
+
+output_str='|'.join([str(x) for x in output])
+sys.stdout.write(output_str+'\n')
+
+PYTHONEOF
+done
 }
 
 # $1 ==> changeId or number or commitSha1Hash
 __get_change(){
-    unset this_id this_number this_project this_branch this_url this_owner_username this_owner_email this_currentPatchSet_number this_currentPatchSet_revision this_currentPatchSet_ref
-    IFS='|' read -r this_id this_number this_project this_branch this_url this_owner_username this_owner_email this_currentPatchSet_number this_currentPatchSet_revision this_currentPatchSet_ref <<< "$(gerrit query --format=json --current-patch-set "$@" | sed -ne '1p;q' | getJsonValue "None if _ is None else '|'.join([ x if x is not None else 'None' for x in [ _.get('id'), _.get('number'), _.get('project'), _.get('branch'), _.get('url'), None if _.get('owner') is None else _.get('owner').get('username'), None if _.get('owner') is None else _.get('owner').get('email'), None if _.get('currentPatchSet') is None else _.get('currentPatchSet').get('number'), None if _.get('currentPatchSet') is None else  _.get('currentPatchSet').get('revision'), None if _.get('currentPatchSet') is None else _.get('currentPatchSet').get('ref')]])")"
+    unset change_id \
+        change_number \
+        change_owner_username \
+        change_owner_email \
+        change_status \
+        change_lastupdated \
+        change_project \
+        change_branch \
+        change_patchsets \
+        change_cur_number \
+        change_cur_ref \
+        change_cur_username \
+        change_url \
+        change_subject
 
-    [[ "$this_number" == "None" ]] && warn "获取change: $1, 相关信息失败"
+    IFS='|' read -r change_id \
+        change_number \
+        change_owner_username \
+        change_owner_email \
+        change_status \
+        change_lastupdated \
+        change_project \
+        change_branch \
+        change_patchsets \
+        change_cur_number \
+        change_cur_ref \
+        change_cur_username \
+        change_url \
+        change_subject <<< "$(__query_change "$@")"
+
+    [[ -z "$change_number" ]] && warn "获取change: $1, 相关信息失败"
 }
 
-__list(){
-     # get "$rest_url/a/changes/?q=is:open+reviewer:self"
-     python - "$(get "$rest_url/a/changes/?q=is:open+reviewer:self&q=is:open+owner:self")" <<'EOF'
-# -*- encoding:utf-8 -*-
-import json,sys
-_=json.loads(sys.argv[1])
+__list_usage(){
+cat <<EOF
 
-all_change_numbers=[]
+$this --help|-h
+$this [--incomming] [--outgoing]
 
-def print_change(change):
-    if change['_number'] in all_change_numbers:
-        return
-    else:
-        all_change_numbers.append(change['_number'])
-    print '-----+------------+--------------+---------------------+-----------------------------------------'
-    print "%4s | %-10s | %-12s | %-18s | %-s" % (change['_number'], change['owner']['name'], change['project'], change['updated'][0:19], change['subject'].split('\n')[0][0:60])
+--help|-h: 查看帮助.
+--incomming: 查看发给我review的change.(默认)
+--outgoing: 查看我发起review的change.
 
-if len(_) > 0:
-    print '================================================================================================='
-    print ' id  | owner      | project      | update              | subject'
-    for change in _:
-        if isinstance(change, list):
-            for __i in change:
-                print_change(__i)
-        else:
-            print_change(change)
-    print '================================================================================================='
-else:
-    print "no changes to you."
+例如:
+
+$this list             # 查看给我的review.
+$this list --outgoing  # 查看我发起的review.
+$this lsit --incomming # 查看发给我的review.
+
 EOF
 }
 
-#get "$rest_url/a/changes/?q=492"
+__list(){
+
+    local LIST_ARGS="$(getopt -o 'h' --long help,incomming,outgoing -- "$@")"
+    [[ $? != "0" ]] && { echo "argument error."; return 1; };
+    eval set -- "$LIST_ARGS"
+    while :; do
+        case "${1}" in
+            -h|--help) __list_usage; return ;;
+            --incomming) show_incomming=true; shift;;
+            --outgoing) show_outgoing=true; shift;;
+            --) shift; break ;;
+            *) echo "unknow options"; return 1 ;;
+        esac
+    done
+    local QUERY=()
+    if [[ "$show_incomming" != "true" ]] && [[ "$show_outgoing" != "true" ]]; then
+        QUERY=('(' 'is:reviewer' 'status:open' ')' 'OR' '(' 'is:owner' 'status:open' ')')
+    fi
+
+    if [[ "$show_incomming" == "true" ]];then
+        [[ ${#QUERY[@]} -gt 0 ]] && QUERY+=('OR')
+        QUERY+=( '(' 'is:reviewer' 'status:open' ')')
+    fi
+
+    if [[ "$show_outgoing" == "true" ]]; then
+        [[ ${#QUERY[@]} -gt 0 ]] && QUERY+=('OR')
+        QUERY+=( '(' 'is:owner' 'status:open' ')')
+    fi
+
+    printf '%6s=%10s=%7s=%13s=%s\n' "======" "==========" "=======" "=============" "================================================================="
+    printf '%6s|%10s|%7s|%13s|%s\n' "number" "     owner" " status" "   lastupdate" "       subject"
+    __query_change "${QUERY[@]}"  | \
+        while IFS='|' read -r _change_id \
+            _change_number \
+            _change_owner_username \
+            _change_owner_email \
+            _change_status \
+            _change_lastupdated \
+            _change_project \
+            _change_branch \
+            _change_patchsets \
+            _change_cur_number \
+            _change_cur_ref \
+            _change_cur_username \
+            _change_url \
+            _change_subject; do
+            printf '%6s+%10s+%7s+%13s+%s\n' "------" "----------" "-------" "-------------" "-----------------------------------------------------------------"
+            printf '%6d|%10s|%7s|%13s|%s\n' "$_change_number" "$_change_owner_username" "$_change_status" "$_change_lastupdated" "$_change_subject"
+        done
+    printf '%6s=%10s=%7s=%13s=%s\n' "======" "==========" "=======" "=============" "================================================================="
+}
+
+__push_usage(){
+    cat<<EOF
+
+$this push -h|--help
+$this push [remote] [ref:branche] [-r|--reviewer {reviewer,...}]
+
+例如:
+$this push                           # 会把当前(HEAD)commit提交到gerrit
+$this push -rxiexh3,luozy3           # 会把当前(HEAD)commit提交到gerrit, 并向xiexh3和luozy3发起review.
+$this push origin HEAD:u4master      # 会把HEAD提交到gerrit
+$this push origin HEAD:mybranch      # 会把HEAD提交到gerrit
+
+EOF
+}
 
 # 发起review
 __push(){
@@ -176,13 +312,14 @@ __push(){
     local __local_ref
     local __remote_branch
 
-    PUSH_ARGS="$(getopt -o 'r:h' --long help,reviewer -- "$@")"
+    PUSH_ARGS="$(getopt -o 'r:h' --long help,reviewer,owner -- "$@")"
     [[ $? != "0" ]] && { echo "argument error."; return 1; };
     eval set -- "$PUSH_ARGS"
     while :; do
         case "${1}" in
             -r|--reviewer) IFS=',' read -a reviewer <<< "$2"; shift 2;;
-            -h|--help) return ;;
+            --owner) add_owner_reviewer="true"; shift;;
+            -h|--help) __push_usage; return ;;
             --) shift; break ;;
             *) echo "unknow options"; return 1 ;;
         esac
@@ -194,28 +331,71 @@ __push(){
         IFS=':' read -r __local_ref __remote_branch <<<"$2"
     }
 
+    local __upstream
     [[ -z "$__remote_branch" ]] && {
-        upstream="$($GIT for-each-ref --format='%(upstream)' "refs/heads/$CURRENT")"
-        [[ -n "$upstream" ]] && __remote_branch="${upstream#refs/remotes/*/}"
+        __upstream="$($GIT for-each-ref --format='%(upstream)' "refs/heads/$CURRENT")"
+        [[ -n "$__upstream" ]] && __remote_branch="${__upstream#refs/remotes/*/}"
+    }
+
+    [[ -z "$__remote_branch" ]] && {
+        __push_usage
+
+        die "必须提供远程分支."
     }
 
     [[ -z "$__local_ref" ]] && __local_ref=HEAD
 
     [[ -z "$($GIT ls-remote "$REMOTE" "$__remote_branch")" ]] && die "remote $REMOTE not found branch: $__remote_branch"
-    if [[ ${#reviewer[@]} -eq 0 ]]; then
+
+
+    if ! git merge-base --is-ancestor "refs/remotes/$REMOTE/$__remote_branch" "$__local_ref"
+    then
+        warn "本地($__local_ref)没有同步远程($REMOTE/$__remote_branch)的更新."
+        if [[ -n "$__upstream" ]]; then
+            warn "可以考虑执行: git pull --rebase $REMOTE $__remote_branch , 进行更新."
+        else
+            warn "可以考虑执行: git fetch $REMOTE -a; git rebase $REMOTE/$__remote_branch , 进行更新."
+        fi
+        exit 1
+    fi
+
+    local push_change_num="$(git rev-list "refs/remotes/$REMOTE/$__remote_branch".."$__local_ref" | wc -l)"
+
+    if [[ "$push_change_num" -gt 1 ]]; then
+        warn "每次push建议只提交一个change, 当前会提交${push_change_num}个change."
+        ask_yes_no "是否继续本次push? " 'n' || exit 0
+    fi
+
+    if [[ "$push_change_num" -eq 0 ]]; then
+        warn "当前不会有任何change会提交到gerrit."
+        ask_yes_no "是否继续本次push? " 'n' || exit 0
+    fi
+
+    if [[ ${#reviewer[@]} -eq 0 ]] && [[ "$add_owner_reviewer" != "true" ]] ; then
         run $GIT push "$REMOTE" "$__local_ref:refs/for/$__remote_branch"
     else
         local __i
-        local reviewer_params
+        local reviewers=()
         for __i in "${reviewer[@]}"; do
             if echo "$__i" | grep -q "@"; then
-                reviewer_params="$reviewer_params,r=$__i";
+                reviewers+=("$__i")
             else
-                reviewer_params="$reviewer_params,r=$__i@ucweb.com";
+                reviewers+=("$__i@ucweb.com")
             fi
         done
-        reviewer_params="${reviewer_params#,}"
-        run $GIT push "$REMOTE" "$__local_ref:refs/for/$__remote_branch%$reviewer_params"
+
+        reviewers+=( $("$this_script_dir/git-owner-diff" "$__local_ref" "refs/remotes/$REMOTE/$__remote_branch") )
+        reviewers=( $(printf "%s\n" "${reviewers[@]}"|sort -u) )
+
+        local __j
+        for __j in "${reviewers[@]}"; do
+            [[ -n "$reviewer_params" ]] &&  reviewer_params="${reviewer_params},"
+            reviewer_params="${reviewer_params}r=$__j"
+        done
+
+        [[ -n "$reviewer_params" ]] && reviewer_params="%$reviewer_params"
+
+        run $GIT push "$REMOTE" "$__local_ref:refs/for/${__remote_branch}${reviewer_params}"
     fi
 }
 
@@ -225,33 +405,51 @@ __push(){
 # 把change应用到本地.
 # $1 ==> changeId or number or commitSha1Hash
 __pull(){
-    local __local_change_id="$1"
-    local __local_change_patch_set
-    [[ -z "$__local_change_id" ]] && __guess_change_number __local_change_id __local_change_patch_set
-    __get_change "$__local_change_id"
-
-    remote_ref="$this_currentPatchSet_ref"
-
-    [[ ! "$remote_ref" == refs/* ]] && die "获取$@ 的patch失败."
-    local_ref="changes/${remote_ref#refs/changes/*/}"
-
-    [[ -n "$($GIT rev-parse "$local_ref")" ]] && run $GIT branch -D "$local_ref"
-    run $GIT fetch "$REMOTE" "$remote_ref" && run $GIT checkout -b "$local_ref" FETCH_HEAD
+    __fetch "$@"
+    run git checkout "changes/$change_number/$change_cur_number"
 }
 
 # $1 ==> changeId or number or commitSha1Hash
+__fetch_usage(){
+    cat<<EOF
+
+$this fetch -h|--help
+$this fetch CHANGE_NUMBER[,PATCHSET]
+EOF
+}
 __fetch(){
-    local __local_change_id="$1"
+    local FETCH_ARGS="$(getopt -o 'h' --long help -- "$@")"
+    [[ $? != "0" ]] && { echo "argument error."; return 1; };
+    eval set -- "$FETCH_ARGS"
+    while :; do
+        case "${1}" in
+            -h|--help) __fetch_usage; return ;;
+            --) shift; break ;;
+            *) echo "unknow options"; return 1 ;;
+        esac
+    done
+
+    local __local_change_id
     local __local_change_patch_set
-    [[ -z "$__local_change_id" ]] && __guess_change_number __local_change_id __local_change_patch_set
+
+    if [[ $# -eq 0 ]];then
+        __guess_change_number __local_change_id __local_change_patch_set
+        if ! is_integer "$__local_change_id"; then
+            __fetch_usage; die '必须提供 CHANGE_NUMBER';
+        fi
+    else
+        [[ ! "$1" =~ ^[1-9][0-9]*$  ]] && die "<change number>必须是一个数字."
+        __local_change_id="$1"
+    fi
+
 
     __get_change "$__local_change_id"
 
-    if ! is_integer $this_number; then
+    if ! is_integer $change_number; then
         die "获取change失败: $1"
     fi
 
-    remote_ref="${this_currentPatchSet_ref}"
+    remote_ref="${change_cur_ref}"
 
     "$GIT" ls-remote "${REMOTE}" | grep "${remote_ref%/*}" | awk '{print $2;}' | while read REF
     do
@@ -259,51 +457,75 @@ __fetch(){
             run git branch "changes/${REF#refs/changes/*/}" FETCH_HEAD
     done
 }
+__code_review_usage(){
+    cat<<EOF
+
+$this review -h|--help
+$this review {CHANGE_NUMBER}[,PATCHSET] [--verified|-v 0|1] [--code-review|-c -2|-1|0|1|2] [--message|-m MSG]
+
+--verified: 0,1 一般人员不提供. 可选项.
+--code-review: -2,-1,0,1,2 打分. 必选.
+--message:  review附加信息. 可选.
+
+当没有提供--code-review, 选项的时候, 就会开启交互式.
+
+EOF
+}
 
 __code_review() {
 
-
-    local REVIEW_ARGS="$(getopt -o ':c:v:m' --long code-review,verified,message -- "$@")"
     local CODE_REVIEW
     local VERIFIED
     local MESSAGE
-
+    local REVIEW_ARGS="$(getopt -o 'hc:v:m' --long help,code-review:,verified:,message: -- "$@")"
     [[ $? != "0" ]] && { echo "argument error."; return 1; };
-
     eval set -- "$REVIEW_ARGS"
-
-
     while :; do
         case "${1}" in
             -c|--code-review) CODE_REVIEW="$2"; shift 2 ;;
             -v|--verified) VERIFIED="$2" ; shift 2 ;;
             -m|--message) MESSAGE="$2" ; shift 2 ;;
+            -h|--help) __code_review_usage; return ;;
             --) shift; break ;;
-            *) echo "unknow options"; exit 1 ;;
+            *) die "unknow options $1" ;;
         esac
     done
 
-    local __local_change_id="$1"
+    local __local_change_id
     local __local_change_patch_set
-    [[ -z "$__local_change_id" ]] && __guess_change_number __local_change_id __local_change_patch_set
+
+    if [[ $# -eq 0 ]];then
+        __guess_change_number __local_change_id __local_change_patch_set
+        if ! is_integer "$__local_change_id"; then
+            __code_review_usage; die '必须提供 CHANGE_NUMBER';
+        fi
+    else
+        [[ ! "$1" =~ ^[1-9][0-9]*$  ]] && die "<change number>必须是一个数字."
+        __local_change_id="$1"
+    fi
+
     __get_change "$__local_change_id"
-    if ! is_integer $this_number; then
+    if ! is_integer $change_number; then
         die "获取change失败: $1"
     fi
-    change_project="$this_project"
-    change_patch_set="$this_currentPatchSet_number"
-    change="$this_number"
+    change_project="$change_project"
+    change_patch_set="$change_cur_number"
+    change="$change_number"
 
 
     local CMD=("review")
-    if [[ -c /dev/fd/1 ]]; then
-        local zero="0"
+    if [[ -z "$CODE_REVIEW" ]]; then
+        if [[ -c /dev/fd/1 ]]; then
+            local zero="0"
 
-        read -e -p "Verified (-1..+1) [0] : " VERIFIED
-        read -e -p "Code review (-2..+2) [0] : " CODE_REVIEW
+            read -e -p "Verified (-1..+1) [0](可选) : " VERIFIED
+            read -e -p "Code review (-2..+2) [0] : " CODE_REVIEW
 
-        echo "You may supply a message. Hit return once your are done."
-        read -e -p "Message: " MESSAGE
+            echo "You may supply a message. Hit return once your are done."
+            read -e -p "Message: " MESSAGE
+        else
+            die "没有提供--code-review选项, 进行打分."
+        fi
     fi
 
     CODE_REVIEW="${CODE_REVIEW:-$zero}"
@@ -316,14 +538,43 @@ __code_review() {
     run gerrit "${CMD[@]}"
 }
 
+__submit_usage(){
+    cat<<EOF
+
+$this submit -h|--help
+$this submit {CHANGE_NUMBER}[,PATCHSET] [--message|-m MSG]
+EOF
+}
+
 __submit(){
 
-    local __local_change_id="$1"
+    local SUBMIT_ARGS="$(getopt -o 'h' --long help -- "$@")"
+    [[ $? != "0" ]] && { die "argument error."; };
+    eval set -- "$SUBMIT_ARGS"
+    while :; do
+        case "${1}" in
+            -h|--help) __submit_usage; return ;;
+            --) shift; break ;;
+            *) die "unknow options:$1" ;;
+        esac
+    done
+
+    local __local_change_id
     local __local_change_patch_set
-    [[ -z "$__local_change_id" ]] && __guess_change_number __local_change_id __local_change_patch_set
+
+    if [[ $# -eq 0 ]];then
+        __guess_change_number __local_change_id __local_change_patch_set
+        if ! is_integer "$__local_change_id"; then
+            __submit_usage; die '必须提供 CHANGE_NUMBER';
+        fi
+    else
+        [[ ! "$1" =~ ^[1-9][0-9]*$  ]] && die "<change number>必须是一个数字."
+        __local_change_id="$1"
+    fi
+
     __get_change "$__local_change_id"
 
-    if ! is_integer $this_number; then
+    if ! is_integer $change_number; then
         die "获取change失败: $1"
     fi
 
@@ -332,29 +583,60 @@ __submit(){
 
     local CMD=("review")
     CMD+=("--submit")
-    CMD+=("--project=$this_project" "$this_number,$this_currentPatchSet_number")
+    CMD+=("--project=$change_project" "$change_number,$change_cur_number")
     if [[ -n $MESSAGE ]]; then
         CMD+=("--message=\"$MESSAGE\"")
     fi
 
     run gerrit "${CMD[@]}"
 }
+
+__abandon_usage(){
+    cat<<EOF
+
+$this abandon -h|--help
+$this abandon {CHANGE_NUMBER}[,PATCHSET] [--message|-m MSG]
+EOF
+}
 __abandon() {
-    local __local_change_id="$1"
+
+    local ABANDON_ARGS="$(getopt -o 'h' --long help -- "$@")"
+    [[ $? != "0" ]] && { die "argument error."; };
+    eval set -- "$ABANDON_ARGS"
+    while :; do
+        case "${1}" in
+            -h|--help) __abandon_usage; return ;;
+            --) shift; break ;;
+            *) die "unknow options:$1" ;;
+        esac
+    done
+
+    local __local_change_id
     local __local_change_patch_set
-    [[ -z "$__local_change_id" ]] && __guess_change_number __local_change_id __local_change_patch_set
+
+    if [[ $# -eq 0 ]];then
+        __guess_change_number __local_change_id __local_change_patch_set
+        if ! is_integer "$__local_change_id"; then
+            __abandon_usage; die '必须提供 CHANGE_NUMBER';
+        fi
+    else
+        [[ ! "$1" =~ ^[1-9][0-9]*$  ]] && die "<change number>必须是一个数字."
+        __local_change_id="$1"
+    fi
+
+
     __get_change "$__local_change_id"
 
-    if ! is_integer $this_number; then
+    if ! is_integer $change_number; then
         die "获取change失败: $1"
     fi
 
-    echo "You may supply a message. Hit return once your are done."
+    echo "你可以提供一个abandone的Message, 若不想提供直接回车就好了."
     read -e -p "Message: " MESSAGE
 
     local CMD=("review")
     CMD+=("--abandon")
-    CMD+=("--project=$this_project" "$this_number,$this_currentPatchSet_number")
+    CMD+=("--project=$change_project" "$change_number,$change_cur_number")
     if [[ -n $MESSAGE ]]; then
         CMD+=("--message=\"$MESSAGE\"")
     fi
@@ -362,13 +644,42 @@ __abandon() {
     run gerrit "${CMD[@]}"
 }
 
+__restore_usage(){
+    cat<<EOF
+
+$this restore -h|--help
+$this restore {CHANGE_NUMBER}[,PATCHSET] [--message|-m MSG]
+EOF
+}
+
 __restore() {
-    local __local_change_id="$1"
+    local RESTORE_ARGS="$(getopt -o 'h' --long help -- "$@")"
+    [[ $? != "0" ]] && { die "argument error."; };
+    eval set -- "$RESTORE_ARGS"
+    while :; do
+        case "${1}" in
+            -h|--help) __restore_usage; return ;;
+            --) shift; break ;;
+            *) die "unknow options:$1" ;;
+        esac
+    done
+
+    local __local_change_id
     local __local_change_patch_set
-    [[ -z "$__local_change_id" ]] && __guess_change_number __local_change_id __local_change_patch_set
+
+    if [[ $# -eq 0 ]];then
+        __guess_change_number __local_change_id __local_change_patch_set
+        if ! is_integer "$__local_change_id"; then
+            __restore_usage; die '必须提供 CHANGE_NUMBER';
+        fi
+    else
+        [[ ! "$1" =~ ^[1-9][0-9]*$  ]] && die "<change number>必须是一个数字."
+        __local_change_id="$1"
+    fi
+
     __get_change "$__local_change_id"
 
-    if ! is_integer $this_number; then
+    if ! is_integer $change_number; then
         die "获取change失败: $1"
     fi
 
@@ -377,7 +688,7 @@ __restore() {
 
     local CMD=("review")
     CMD+=("--restore")
-    CMD+=("--project=$this_project" "$this_number,$this_currentPatchSet_number")
+    CMD+=("--project=$change_project" "$change_number,$change_cur_number")
     if [[ -n $MESSAGE ]]; then
         CMD+=("--message=\"$MESSAGE\"")
     fi
@@ -385,13 +696,42 @@ __restore() {
     run gerrit "${CMD[@]}"
 }
 
+__show_usage(){
+    cat<<EOF
+
+$this show -h|--help
+$this show {CHANGE_NUMBER}
+EOF
+}
+
 __show(){
-    local __local_change_id="$1"
+    local SHOW_ARGS="$(getopt -o 'h' --long help -- "$@")"
+    [[ $? != "0" ]] && { die "argument error."; };
+    eval set -- "$SHOW_ARGS"
+    while :; do
+        case "${1}" in
+            -h|--help) __show_usage; return ;;
+            --) shift; break ;;
+            *) die "unknow options:$1" ;;
+        esac
+    done
+
+    local __local_change_id
     local __local_change_patch_set
-    [[ -z "$__local_change_id" ]] && __guess_change_number __local_change_id __local_change_patch_set
+
+    if [[ $# -eq 0 ]];then
+        __guess_change_number __local_change_id __local_change_patch_set
+        if ! is_integer "$__local_change_id"; then
+            __show_usage; die '必须提供 CHANGE_NUMBER';
+        fi
+    else
+        [[ ! "$1" =~ ^[1-9][0-9]*$  ]] && die "<change number>必须是一个数字."
+        __local_change_id="$1"
+    fi
+
     __get_change "$__local_change_id"
 
-    if ! is_integer $this_number; then
+    if ! is_integer $change_number; then
         die "获取change失败: $1"
     fi
     run gerrit "query" \
@@ -402,33 +742,100 @@ __show(){
         "--comments" \
         "--commit-message" \
         "--all-reviewers" \
-        "change:'$this_number'" \
-        "project:${this_project}"
+        "change:'$change_number'" \
+        "project:${change_project}"
+}
+
+__open_usage(){
+    cat<<EOF
+
+$this open -h|--help
+$this open {CHANGE_NUMBER}
+EOF
 }
 
 __open(){
 
-    local __local_change_id="$1"
+    local OPEN_ARGS="$(getopt -o 'h' --long help -- "$@")"
+    [[ $? != "0" ]] && { die "argument error."; };
+    eval set -- "$OPEN_ARGS"
+    while :; do
+        case "${1}" in
+            -h|--help) __open_usage; return ;;
+            --) shift; break ;;
+            *) die "unknow options:$1" ;;
+        esac
+    done
+
+    local __local_change_id
     local __local_change_patch_set
-    [[ -z "$__local_change_id" ]] && __guess_change_number __local_change_id __local_change_patch_set
+
+    if [[ $# -eq 0 ]];then
+        __guess_change_number __local_change_id __local_change_patch_set
+        if ! is_integer "$__local_change_id"; then
+            __open_usage; die '必须提供 CHANGE_NUMBER';
+        fi
+    else
+        [[ ! "$1" =~ ^[1-9][0-9]*$  ]] && die "<change number>必须是一个数字."
+        __local_change_id="$1"
+    fi
+
     __get_change "$__local_change_id"
 
-    if ! is_integer $this_number; then
+    if ! is_integer $change_number; then
         die "获取change失败: $1"
     fi
-    run x-www-browser "$this_url"
+    run x-www-browser "$change_url"
 }
 
+__comment_usage(){
+    cat<<EOF
+
+$this comment -h|--help
+GET_COMMENTS | $this comment {CHANGE_NUMBER}
+
+GET_COMMENTS产生的数据格式必须为:
+
+filename:lineno:message
+每行三列, 每列使用':'分隔, 第一列为文件路径, 第二列为行号, 第三列为注释信息.
+
+EOF
+}
 __comment(){
-    local __local_change_id="$1"
-    local __local_change_patch_set
+    local COMMENT_ARGS="$(getopt -o 'h' --long help -- "$@")"
+    [[ $? != "0" ]] && { die "argument error."; };
+    eval set -- "$COMMENT_ARGS"
+    while :; do
+        case "${1}" in
+            -h|--help) __comment_usage; return ;;
+            --) shift; break ;;
+            *) die "unknow options:$1" ;;
+        esac
+    done
+
+    [[ $# -eq 0 ]] && { __comment_usage; die '必须提供 CHANGE_NUMBER'; } 
+    [[ ! "$1" =~ ^[1-9][0-9]*$  ]] && die "<change number>必须是一个数字."
+
     local __local_line_count=0
-    [[ -z "$__local_change_id" ]] && __guess_change_number __local_change_id __local_change_patch_set
+
+    local __local_change_id
+    local __local_change_patch_set
+
+    if [[ $# -eq 0 ]];then
+        __guess_change_number __local_change_id __local_change_patch_set
+        if ! is_integer "$__local_change_id"; then
+            __comment_usage; die '必须提供 CHANGE_NUMBER';
+        fi
+    else
+        [[ ! "$1" =~ ^[1-9][0-9]*$  ]] && die "<change number>必须是一个数字."
+        __local_change_id="$1"
+    fi
+
     __get_change "$__local_change_id"
 
-    change_project="$this_project"
-    change_patch_set="$this_currentPatchSet_number"
-    change="$this_number"
+    change_project="$change_project"
+    change_patch_set="$change_cur_number"
+    change="$change_number"
 
     local line_count=0
     local comment_count=0
@@ -437,7 +844,7 @@ __comment(){
         (( line_count++ ))
         if [[ "$_line" =~ ^[0-9]+$ ]];then
             if [[ -n "$(put -H "Content-Type: application/json;charset=UTF-8" -d "{ \"path\": \"$_path\", \"line\": $_line, \"message\": \"$_msg\" }" \
-                "$rest_url/a/changes/$this_number/revisions/$this_currentPatchSet_number/drafts" | getJsonValue '_.get("id")')" ]]; then
+                "$rest_url/a/changes/$change_number/revisions/$change_cur_number/drafts" | getJsonValue '_.get("id")')" ]]; then
                 good "$ $_path:$_line:$_msg"
                 (( comment_count++ ))
             fi
@@ -471,36 +878,68 @@ $this restore <change number>                       # 重新开启abandon的chan
 $this open <change number>                          # 浏览器浏览该change
 $this set-reviewer <change number>                  # 添加或删除reviewer(TODO)
 $this ban-commit                                    # 锁定, 禁止提交(TODO)
+$this comment                                       # 给文件写review注释.(可作为review机器人)
 
-HEAD为'refs/heads/changes/change_numer/patch_set_numer'形式的分支可以不提供<change number>, 会自动获取. 若为其他分支需要提供<change number>
+HEAD为'refs/heads/changes/change_number/patch_set_numer'形式的分支可以不提供<change number>, 会自动获取. 若为其他分支需要提供<change number>
 
 EOF
 }
 
+__config_usage(){
+cat<<EOF
+
+$this config -h|--help
+$this config [--username|-u USERNAME] [--ssh_host SSH_HOST:PORT] [--http_host HTTP_HOST:PORT] [--http_password HTTP_PASSWORD]
+
+若这四个参数没有提供齐全, 就会启用交互式获取剩余参数.
+
+
+http_password获取方式: 浏览器登录gerrit页面 -> 页面右上角,用户名下拉 -> 设置 ->
+http password -> 若没有PASSWORD就点击generate password.
+
+EOF
+}
 
 __config(){
+    local CONFIG_ARGS="$(getopt -o 'h' --long help,username:,ssh_host:,http_host:,http_password: -- "$@")"
     local USERNAME HTTP_PASSWORD SSH_HOST HTTP_HOST PROJECT
-
-    while true; do
-        read -e -p "username(登入gerrit的用户名): "  USERNAME
-        [[ -n "$USERNAME" ]] && break
+    [[ $? != "0" ]] && { die "argument error."; };
+    eval set -- "$CONFIG_ARGS"
+    while :; do
+        case "${1}" in
+            -h|--help) __config_usage; return ;;
+            --username) USERNAME="$2"; shift 2 ;;
+            --ssh_host) SSH_HOST="$2"; shift 2 ;;
+            --http_host) HTTP_HOST="$2"; shift 2 ;;
+            --http_password) HTTP_PASSWORD="$2"; shift 2 ;;
+            --) shift; break ;;
+            *) die "unknow options:$1" ;;
+        esac
     done
 
-    while true; do
-        read -e -p "ssh host:port: " SSH_HOST
-        [[ -n "$SSH_HOST" ]] && break
-    done
-    while true; do
-        read -e -p "http host:port: " HTTP_HOST
-        [[ -n "$HTTP_HOST" ]] && break
-    done
 
-    echo "浏览器登录gerrit页面 -> 页面右上角,用户名下拉 -> 设置 ->"
-    echo "http password -> 若没有PASSWORD就点击generate password."
-    while true; do
-        read -e -p "http password: " HTTP_PASSWORD
-        [[ -n "$HTTP_PASSWORD" ]] && break
-    done
+    if [[ -c /dev/fd/1 ]]; then
+        [[ -z "$USERNAME" ]] && while true; do
+            read -e -p "username(登入gerrit的用户名): "  USERNAME
+            [[ -n "$USERNAME" ]] && break
+        done
+
+        read -e -p "ssh host:port [不填先就默认为 gerritu4.ucweb.local:29418]: " SSH_HOST
+        [[ -z "$SSH_HOST" ]] && SSH_HOST="gerritu4.ucweb.local:29418"
+        read -e -p "http host:port [不填先就默认为 gerritu4.ucweb.local:8080]: " HTTP_HOST
+        [[ -z "$HTTP_HOST" ]] && HTTP_HOST="gerritu4.ucweb.local:8080"
+
+        echo "浏览器登录gerrit页面 -> 页面右上角,用户名下拉 -> 设置 ->"
+        echo "http password -> 若没有PASSWORD就点击generate password."
+        [[ -z "$HTTP_PASSWORD" ]] && while true; do
+            read -e -p "http password: " HTTP_PASSWORD
+            [[ -n "$HTTP_PASSWORD" ]] && break
+        done
+    fi
+
+    if [[ -z "$USERNAME" ]] || [[ -z "$HTTP_PASSWORD" ]] || [[ -z "$HTTP_HOST" ]] || [[ -z "$SSH_HOST" ]];then
+        die "USERNAME=$USERNAME; HTTP_PASSWORD=$HTTP_PASSWORD; HTTP_HOST=$HTTP_HOST; SSH_HOST=$SSH_HOST"
+    fi
 
     git config gerrit.username "$USERNAME"
     git config gerrit.httppassword "$HTTP_PASSWORD"
@@ -511,6 +950,20 @@ __config(){
     echo "http_password=$(git config gerrit.httppassword)"
     echo "http_host=$(git config gerrit.httphost)"
     echo "ssh_host=$(git config gerrit.sshhost)"
+
+    get_gerrit_configure
+    run ssh -T  "${SSH_HOST%:*}" -p "${SSH_HOST#*:}" -l "$USERNAME"
+    local return_code=$?
+    if [[ "$return_code" != "127" ]]; then
+        die "ssh免登入${SSH_HOST}失败! 请检查ssh相关配置."
+    fi
+
+    if [[ "$(get "$rest_url/a/accounts/self" | getJsonValue '_["username"]')" != "$USERNAME" ]]; then
+        die "gerrit配置失败! 当前配置的用户名为: ${USERNAME}, gerrit上获取的信息为: $(get "$rest_url/a/accounts/self")"
+    fi
+
+    __self_info
+    good "配置成功!"
 }
 
 __check_config(){
@@ -543,7 +996,10 @@ __self_info(){
 
 [[ $# -eq 0 ]] && { usage; exit 0; }
 
+get_gerrit_configure
+
 [[ ! "$1" =~ ^(config|help)$ ]] && __check_config
+
 
 case "${1}" in
     config)
@@ -567,7 +1023,7 @@ case "${1}" in
     push)
         __push "${@:2}"
         ;;
-    review)
+    review|code-review)
         __code_review "${@:2}"
         ;;
     submit)
